@@ -1,7 +1,5 @@
 streamlit
 pandas
 plotly
-requests
-beautifulsoup4
-lxml
-html5lib
+pdfplumber
+openpyxl
