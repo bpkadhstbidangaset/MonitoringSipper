@@ -1,7 +1,7 @@
 streamlit
 pandas
 plotly
-playwright
+requests
 beautifulsoup4
 lxml
 html5lib
