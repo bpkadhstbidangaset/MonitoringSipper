@@ -7,7 +7,6 @@ import streamlit as st
 from bs4 import BeautifulSoup
 import urllib3
 
-# Nonaktifkan warning SSL/InsecureRequest
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
@@ -21,11 +20,10 @@ st.set_page_config(
 USERNAME = st.secrets.get("SIPPER_USERNAME", "Administrator")
 PASSWORD = st.secrets.get("SIPPER_PASSWORD", "12345678")
 
-# Menggunakan protokol HTTP (Port 80) sesuai konfigurasi server SiPPER
 BASE_URL = "http://sipper.hstkab.go.id"
 LOGIN_URL = f"{BASE_URL}/login_.php?IncFile=login"
 
-# 2. FUNGSI KONVERSI NILAI RUPIAH KE NUMERIK
+# 2. FUNGSI KONVERSI ANGKA RUPIAH
 def clean_currency(val):
     if pd.isna(val) or str(val).strip() in ["-", "", "nan", "None", "null"]:
         return 0.0
@@ -35,25 +33,25 @@ def clean_currency(val):
     except ValueError:
         return 0.0
 
-# 3. FUNGSI PENARIKAN DATA OTOMATIS
+# 3. FUNGSI PENARIKAN DATA
 @st.cache_data(ttl=300)
 def fetch_sipper_rekap(custom_report_url=None):
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": f"{BASE_URL}/index.php?IncFile=bG9naW4=",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
     
     try:
-        # A. Proses Login (fUsr & fPas)
+        # A. Login
         payload = {
             "fUsr": USERNAME,
             "fPas": PASSWORD
         }
-        resp_login = session.post(LOGIN_URL, data=payload, headers=headers, timeout=20, verify=False)
+        session.post(LOGIN_URL, data=payload, headers=headers, timeout=20, verify=False)
         
-        # B. URL Target Laporan Rekap Semester
+        # B. Akses URL Laporan / Request Data
         if not custom_report_url:
             report_url = f"{BASE_URL}/index.php?JdL=LAPORAN%20->%20REKAP%20DATA%20PER%20SEMESTER&IncFile=cmVrYXBfcGVyc2VkaWFhbl9zZW1lc3Rlcg==&IdL=VFhwck5VNTNQVDA9"
         else:
@@ -62,27 +60,32 @@ def fetch_sipper_rekap(custom_report_url=None):
         resp_report = session.get(report_url, headers=headers, timeout=25, verify=False)
         
         if resp_report.status_code != 200:
-            return None, f"Gagal memuat halaman laporan (HTTP {resp_report.status_code})"
+            return None, f"HTTP Error {resp_report.status_code}"
 
-        # C. Ekstrak Semua Tabel HTML
+        # C. Cari form data di dalam halaman dan coba kirim tombol Rekap jika ada
+        soup = BeautifulSoup(resp_report.text, "html.parser")
+        
+        # Parsing semua tabel
         tables = pd.read_html(io.StringIO(resp_report.text))
-        
         if not tables:
-            return None, "Tabel data laporan tidak ditemukan pada respon halaman."
+            return None, "Tidak ditemukan tabel pada respon server."
 
-        # Cari tabel data utama (filter tabel navigasi/header)
-        candidate_tables = [t for t in tables if t.shape[1] >= 4 and t.shape[0] > 1]
-        
-        if candidate_tables:
-            df_target = max(candidate_tables, key=lambda t: t.shape[0] * t.shape[1])
+        # Filter tabel yang benar-benar berisi data (bukan header instansi)
+        valid_tables = []
+        for t in tables:
+            # Lewati tabel header/banner yang hanya 1-2 baris atau berisi nama pemkab saja
+            text_dump = " ".join([str(x) for x in t.values.flatten()]).lower()
+            if "kode" in text_dump or "deskripsi" in text_dump or "saldo" in text_dump or "masuk" in text_dump:
+                valid_tables.append(t)
+
+        if valid_tables:
+            # Ambil tabel data yang paling banyak kolom dan barisnya
+            df_target = max(valid_tables, key=lambda t: t.shape[0] * t.shape[1])
+            return df_target, "success"
         else:
-            df_target = max(tables, key=lambda t: t.shape[0] * t.shape[1])
-
-        # Flatten MultiIndex jika header tabel bertingkat
-        if isinstance(df_target.columns, pd.MultiIndex):
-            df_target.columns = ['_'.join(str(c) for c in col).strip() for col in df_target.columns.values]
-
-        return df_target, "success"
+            # Jika tidak ada yang cocok kata kuncinya, ambil tabel dengan baris terbanyak
+            df_target = max(tables, key=lambda t: t.shape[0])
+            return df_target, "warning_format"
 
     except Exception as e:
         return None, str(e)
@@ -98,28 +101,26 @@ if st.sidebar.button("🔄 Tarik Data Terbaru"):
     st.rerun()
 
 custom_url = st.sidebar.text_input(
-    "Custom URL / Endpoint Tabel (Opsional):", 
+    "Custom URL / Endpoint Rekap (DevTools):", 
     value="",
-    placeholder="Contoh: http://sipper.hstkab.go.id/index.php?..."
+    placeholder="Tempel URL request saat klik tombol 'Rekap'"
 )
 
 # Memuat Data
-with st.spinner("Menghubungkan ke http://sipper.hstkab.go.id ..."):
+with st.spinner("Mengambil data dari SiPPER..."):
     df_raw, status = fetch_sipper_rekap(custom_url if custom_url else None)
 
 if df_raw is not None:
-    st.success("✅ Data berhasil diambil dari server SiPPER.")
-
     df = df_raw.copy()
     
-    # Deteksi baris header jika berada di baris data pertama
-    for i in range(min(5, len(df))):
+    # Deteksi baris header kolom
+    for i in range(min(6, len(df))):
         row_vals = [str(x).lower() for x in df.iloc[i].values]
-        if any("deskripsi" in x or "kode" in x for x in row_vals):
+        if any("deskripsi" in x or "kode" in x or "saldo" in x for x in row_vals):
             df.columns = df.iloc[i]
             df = df.iloc[i+1:].reset_index(drop=True)
             break
-            
+
     # Standardisasi nama kolom
     col_mapping = {}
     for col in df.columns:
@@ -138,18 +139,18 @@ if df_raw is not None:
             col_mapping[col] = "Qty_Saldo"
             
     df = df.rename(columns=col_mapping)
-    
-    # Bersihkan baris kosong dan warning PHP
     df = df.dropna(how='all')
-    if "Deskripsi" in df.columns:
-        df = df[~df["Deskripsi"].astype(str).str.contains("Warning:|Notice:", na=False)]
     
-    # Konversi kolom nominal rupiah
+    # Filter baris yang tidak valid
+    if "Deskripsi" in df.columns:
+        df = df[~df["Deskripsi"].astype(str).str.contains("Warning:|Kabupaten|KABUPATEN", na=False)]
+    
+    # Konversi kolom numerik
     for col_name in ["Nilai_Masuk", "Nilai_Keluar", "Nilai_Saldo", "Qty_Saldo"]:
         if col_name in df.columns:
             df[col_name] = df[col_name].apply(clean_currency)
 
-    # --- KARTU KPI METRIK ---
+    # KPI Metrik
     st.markdown("### 📊 Ringkasan Nilai Persediaan")
     k1, k2, k3, k4 = st.columns(4)
     
@@ -161,11 +162,11 @@ if df_raw is not None:
     k1.metric("Total Saldo Akhir", f"Rp {total_saldo:,.0f}".replace(",", "."))
     k2.metric("Total Pengadaan (Masuk)", f"Rp {total_masuk:,.0f}".replace(",", "."))
     k3.metric("Total Pengeluaran", f"Rp {total_keluar:,.0f}".replace(",", "."))
-    k4.metric("Jumlah Rekening", f"{total_item} Item")
+    k4.metric("Jumlah Rekening", f"{total_item} Baris")
 
     st.markdown("---")
 
-    # --- GRAFIK VISUALISASI ---
+    # Visualisasi
     if "Deskripsi" in df.columns and "Nilai_Saldo" in df.columns and df["Nilai_Saldo"].sum() > 0:
         c1, c2 = st.columns(2)
         with c1:
@@ -197,10 +198,9 @@ if df_raw is not None:
                 fig2.update_layout(yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig2, use_container_width=True)
 
-    # --- TABEL RINCIAN ---
+    # Tabel Rincian Data
     st.markdown("### 📋 Rincian Data Persediaan")
     st.dataframe(df, use_container_width=True)
 
 else:
     st.error(f"Gagal mengambil data: {status}")
-    st.info("Catatan: Jika error NameResolutionError tetap muncul di Streamlit Cloud, domain sipper.hstkab.go.id membatasi akses ke jaringan lokal/intranet. Jalankan script ini secara lokal di PC/laptop kantor dengan perintah: streamlit run app.py")
