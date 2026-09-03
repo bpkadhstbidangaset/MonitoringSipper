@@ -1,83 +1,177 @@
 import streamlit as st
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+import io
 import plotly.express as px
+from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="Monitoring Real-Time SiPPER HST", layout="wide")
+st.set_page_config(
+    page_title="Dashboard Monitoring Persediaan SiPPER HST",
+    page_icon="📦",
+    layout="wide"
+)
 
-# 1. AMBIL KREDENSIAL DARI SECRETS (Bukan hardcode di file publik)
-# Pada local: .streamlit/secrets.toml
-# Pada Streamlit Cloud: Pengaturan App -> Secrets
-USERNAME = st.secrets.get("SIPPER_USERNAME", "username_anda")
-PASSWORD = st.secrets.get("SIPPER_PASSWORD", "password_anda")
+# 1. KREDENSIAL DARI SECRETS / INPUT
+USERNAME = st.secrets.get("SIPPER_USERNAME", "Administrator")
+PASSWORD = st.secrets.get("SIPPER_PASSWORD", "12345678")
 
 BASE_URL = "https://sipper.hstkab.go.id"
-LOGIN_URL = f"{BASE_URL}/login"  # Sesuaikan dengan endpoint form login SiPPER
-DATA_URL = f"{BASE_URL}/laporan/rekap-data"  # Endpoint halaman tabel/data laporan
+LOGIN_URL = f"{BASE_URL}/login_.php?IncFile=login"
 
-# 2. FUNGSI PENARIKAN DATA OTOMATIS (DENGAN CACHE WAKTU TERTENTU)
-@st.cache_data(ttl=600)  # Data otomatis di-refresh tiap 10 menit
-def fetch_sipper_data():
+# 2. FUNGSI KONVERSI NILAI RUPIAH
+def clean_currency(val):
+    if pd.isna(val) or str(val).strip() in ["-", "", "nan"]:
+        return 0.0
+    val_str = str(val).replace("Rp", "").replace(".", "").replace(",", ".").strip()
+    try:
+        return float(val_str)
+    except ValueError:
+        return 0.0
+
+# 3. FUNGSI PENARIKAN DATA
+@st.cache_data(ttl=300)
+def fetch_sipper_rekap(custom_report_url=None):
     session = requests.Session()
-    
-    # Header simulasi browser
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": f"{BASE_URL}/index.php?IncFile=bG9naW4="
     }
     
     try:
-        # A. Request halaman login awal (ambil token CSRF jika ada)
-        resp_login_page = session.get(LOGIN_URL, headers=headers, timeout=10)
-        soup = BeautifulSoup(resp_login_page.text, "html.parser")
-        
-        # Contoh ekstraksi token CSRF (sesuaikan name input jika ada)
-        csrf_input = soup.find("input", {"name": "_token"})
-        csrf_token = csrf_input["value"] if csrf_input else ""
-
-        # B. Kirim Payload Login
+        # A. Proses Login
         payload = {
-            "username": USERNAME,
-            "password": PASSWORD,
-            "_token": csrf_token
+            "fUsr": USERNAME,
+            "fPas": PASSWORD
         }
-        post_login = session.post(LOGIN_URL, data=payload, headers=headers, timeout=10)
+        resp_login = session.post(LOGIN_URL, data=payload, headers=headers, timeout=15)
         
-        # C. Ambil halaman data tabel setelah berhasil login
-        resp_data = session.get(DATA_URL, headers=headers, timeout=15)
-        
-        # D. Parsing tabel HTML ke DataFrame Pandas
-        # (Atau parsing respon JSON jika endpoint mengembalikan JSON)
-        tables = pd.read_html(resp_data.text)
-        if tables:
-            df = tables[0]  # Ambil tabel pertama
-            return df, "success"
+        # B. URL Target Halaman Laporan
+        if not custom_report_url:
+            report_url = f"{BASE_URL}/index.php?JdL=LAPORAN%20->%20REKAP%20DATA%20PER%20SEMESTER&IncFile=cmVrYXBfcGVyc2VkaWFhbl9zZW1lc3Rlcg==&IdL=VFhwck5VNTNQVDA9"
         else:
-            return None, "Tabel data tidak ditemukan pada halaman."
+            report_url = custom_report_url
             
+        resp_report = session.get(report_url, headers=headers, timeout=20)
+        
+        if resp_report.status_code != 200:
+            return None, f"Gagal memuat halaman laporan (HTTP {resp_report.status_code})", resp_report.text
+
+        # C. Cek apakah di dalam halaman terdapat tag <iframe> yang memuat tabel data sebenarnya
+        soup = BeautifulSoup(resp_report.text, "html.parser")
+        iframes = soup.find_all("iframe")
+        
+        # Jika ada iframe data, akses URL di dalam iframe tersebut
+        if iframes and not custom_report_url:
+            for iframe in iframes:
+                src = iframe.get("src", "")
+                if src and ("rekap" in src.lower() or "data" in src.lower() or "laporan" in src.lower()):
+                    iframe_url = src if src.startswith("http") else f"{BASE_URL}/{src.lstrip('/')}"
+                    resp_iframe = session.get(iframe_url, headers=headers, timeout=20)
+                    if resp_iframe.status_code == 200:
+                        tables = pd.read_html(io.StringIO(resp_iframe.text))
+                        if tables:
+                            df_target = max(tables, key=lambda t: t.shape[1] * t.shape[0])
+                            return df_target, "success", resp_iframe.text
+
+        # D. Ekstrak Tabel Langsung dari Halaman Utama
+        tables = pd.read_html(io.StringIO(resp_report.text))
+        if not tables:
+            return None, "Tabel data laporan belum ditemukan pada URL ini. Silakan periksa apakah data dimuat via iframe/AJAX.", resp_report.text
+
+        # Ambil tabel dengan kolom terbanyak
+        df_target = max(tables, key=lambda t: t.shape[1] * t.shape[0])
+        
+        # Flatten MultiIndex jika header tabel bertingkat
+        if isinstance(df_target.columns, pd.MultiIndex):
+            df_target.columns = ['_'.join(str(c) for c in col).strip() for col in df_target.columns.values]
+
+        return df_target, "success", resp_report.text
+
     except Exception as e:
-        return None, str(e)
+        return None, str(e), ""
 
-# 3. TAMPILAN DASHBOARD
-st.title("📦 Dashboard Live Monitoring - SiPPER HST")
+# --- 4. TAMPILAN DASHBOARD ---
+st.title("📦 Dashboard Monitoring Persediaan (SiPPER HST)")
+st.caption("Monitoring Persediaan Real-Time Pemerintah Kabupaten Hulu Sungai Tengah")
 
-# Tombol Sinkronisasi Manual
-if st.sidebar.button("🔄 Sinkronisasi Data Sekarang"):
+# Sidebar
+st.sidebar.header("⚙️ Pengaturan & Filter")
+if st.sidebar.button("🔄 Tarik Data Terbaru"):
     st.cache_data.clear()
     st.rerun()
 
-# Memuat Data
-with st.spinner("Menghubungkan ke https://sipper.hstkab.go.id/ ..."):
-    df_raw, status = fetch_sipper_data()
+custom_url = st.sidebar.text_input(
+    "Custom URL Laporan (Opsional):", 
+    value="",
+    help="Jika tabel dimuat di URL/iframe spesifik, tempelkan URL lengkapnya di sini."
+)
+
+with st.spinner("Mengautentikasi dan menarik data dari SiPPER..."):
+    df_raw, status, html_response = fetch_sipper_rekap(custom_url if custom_url else None)
 
 if df_raw is not None:
-    st.success("✅ Terhubung secara langsung ke server SiPPER.")
+    st.success("✅ Data berhasil diambil dari server SiPPER.")
+
+    df = df_raw.copy()
     
-    # Tampilkan Data & Visualisasi
-    st.dataframe(df_raw, use_container_width=True)
+    # Pemetaan kolom otomatis
+    col_mapping = {}
+    for col in df.columns:
+        c_low = str(col).lower()
+        if "deskripsi" in c_low or "nama" in c_low:
+            col_mapping[col] = "Deskripsi"
+        elif "kode" in c_low:
+            col_mapping[col] = "Kode"
+        elif "masuk" in c_low and "nilai" in c_low:
+            col_mapping[col] = "Nilai_Masuk"
+        elif "keluar" in c_low and "nilai" in c_low:
+            col_mapping[col] = "Nilai_Keluar"
+        elif "saldo" in c_low and "nilai" in c_low:
+            col_mapping[col] = "Nilai_Saldo"
+            
+    df = df.rename(columns=col_mapping)
     
-    # Tambahkan visualisasi sesuai kolom data tabel SiPPER
-    # st.plotly_chart(...)
+    for numeric_col in ["Nilai_Masuk", "Nilai_Keluar", "Nilai_Saldo"]:
+        if numeric_col in df.columns:
+            df[numeric_col] = df[numeric_col].apply(clean_currency)
+
+    # KPI Summary Cards
+    st.markdown("### 📊 Ringkasan Nilai Persediaan")
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    
+    total_masuk = df["Nilai_Masuk"].sum() if "Nilai_Masuk" in df.columns else 0.0
+    total_keluar = df["Nilai_Keluar"].sum() if "Nilai_Keluar" in df.columns else 0.0
+    total_saldo = df["Nilai_Saldo"].sum() if "Nilai_Saldo" in df.columns else 0.0
+
+    kpi1.metric("Total Saldo Akhir", f"Rp {total_saldo:,.0f}".replace(",", "."))
+    kpi2.metric("Total Pengadaan / Masuk", f"Rp {total_masuk:,.0f}".replace(",", "."))
+    kpi3.metric("Total Pengeluaran", f"Rp {total_keluar:,.0f}".replace(",", "."))
+    kpi4.metric("Jumlah Rekening", f"{len(df)} Baris")
+
+    st.markdown("---")
+
+    # Visualisasi
+    if "Deskripsi" in df.columns and "Nilai_Saldo" in df.columns:
+        top_saldo = df.nlargest(10, "Nilai_Saldo")
+        fig_bar = px.bar(
+            top_saldo,
+            x="Nilai_Saldo",
+            y="Deskripsi",
+            orientation="h",
+            title="Top 10 Barang Saldo Terbesar",
+            color="Nilai_Saldo",
+            color_continuous_scale="Blues"
+        )
+        fig_bar.update_layout(yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    # Tabel Data
+    st.markdown("### 📋 Rincian Data Persediaan")
+    st.dataframe(df, use_container_width=True)
+
 else:
-    st.error(f"Gagal mengambil data otomatis: {status}")
-    st.info("Catatan: Pastikan URL form login, payload parameter, dan kredensial di secrets sudah sesuai dengan rute internal aplikasi SiPPER.")
+    st.error(f"Status: {status}")
+    
+    # Fitur Inspeksi Debug HTML
+    with st.expander("🔍 Lihat Hasil Respon Halaman (Debug)", expanded=False):
+        st.text_area("Source Code HTML yang diterima:", value=html_response[:3000] if html_response else "Kosong", height=250)
