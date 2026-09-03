@@ -15,7 +15,7 @@ st.set_page_config(
 USERNAME = st.secrets.get("SIPPER_USERNAME", "Administrator")
 PASSWORD = st.secrets.get("SIPPER_PASSWORD", "12345678")
 
-BASE_URL = "https://sipper.hstkab.go.id"
+BASE_URL = "http://sipper.hstkab.go.id"
 LOGIN_URL = f"{BASE_URL}/login_.php?IncFile=login"
 
 # 2. FUNGSI KONVERSI NILAI RUPIAH
