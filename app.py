@@ -1,26 +1,26 @@
-import asyncio
 import io
-import os
-import re
 import warnings
+import urllib3
+import requests
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
 st.set_page_config(
-    page_title="Dashboard Live Monitoring Persediaan SiPPER HST",
+    page_title="Dashboard Monitoring Persediaan SiPPER HST",
     page_icon="📦",
     layout="wide"
 )
 
-# 1. KREDENSIAL DARI SECRETS STREAMLIT
+# 1. KREDENSIAL DARI SECRETS / DEFAULT
 USERNAME = st.secrets.get("SIPPER_USERNAME", "Administrator")
 PASSWORD = st.secrets.get("SIPPER_PASSWORD", "12345678")
+
 BASE_URL = "http://sipper.hstkab.go.id"
+LOGIN_URL = f"{BASE_URL}/login_.php?IncFile=login"
 
 # 2. FUNGSI KONVERSI NILAI RUPIAH KE ANGKA
 def clean_currency(val):
@@ -32,97 +32,76 @@ def clean_currency(val):
     except ValueError:
         return 0.0
 
-# 3. FUNGSI OTOMASI BROWSER MENGAMBIL DATA LANGSUNG (HEADLESS)
-async def scrape_sipper_auto():
-    # Pastikan browser binaries terpasang jika di environment cloud
+# 3. FUNGSI AMBIL DATA OTOMATIS LANGSUNG KE ENDPOINT IFRAME
+@st.cache_data(ttl=300)
+def fetch_sipper_auto(unit_kode="1.02.01.01", tahun="2026", semester="1"):
+    session = requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": f"{BASE_URL}/index.php?IncFile=bG9naW4=",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+    
     try:
-        os.system("playwright install chromium")
-    except:
-        pass
+        # A. Login Otomatis
+        payload = {
+            "fUsr": USERNAME,
+            "fPas": PASSWORD
+        }
+        session.post(LOGIN_URL, data=payload, headers=headers, timeout=15, verify=False)
+        
+        # B. Akses Langsung Endpoint Iframe Laporan (Sesuai DevTools)
+        # Endpoint: rekap_persediaan_semester.php?fKdU=...&fThn=...&fSmt=...&IdL=...
+        report_url = f"{BASE_URL}/rekap_persediaan_semester.php?fKdU={unit_kode}&fThn={tahun}&fSmt={semester}&IdL=VFhwck5VNTNQVDA9"
+        
+        resp = session.get(report_url, headers=headers, timeout=25, verify=False)
+        
+        if resp.status_code != 200:
+            return None, f"HTTP Error {resp.status_code}"
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        context = await browser.new_context()
-        page = await context.new_page()
+        # C. Ekstrak Tabel dari Respon HTML
+        tables = pd.read_html(io.StringIO(resp.text))
+        if not tables:
+            return None, "Tabel data laporan tidak ditemukan pada respon halaman."
 
-        try:
-            # Step A: Buka Halaman Utama SiPPER
-            await page.goto(f"{BASE_URL}/", timeout=30000)
+        # Ambil tabel data utama (tabel dengan jumlah sel terbanyak)
+        df_target = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+        return df_target, "success"
 
-            # Step B: Login Otomatis
-            # Mengisi form fUsr dan fPas
-            await page.fill('input[name="fUsr"]', USERNAME)
-            await page.fill('input[name="fPas"]', PASSWORD)
-            await page.click('input[type="submit"], button[type="submit"], #login, input[value="Login"], input[value="Masuk"]')
-            await page.wait_for_load_state("networkidle", timeout=15000)
-
-            # Step C: Buka Menu Laporan -> Rekap Semester
-            target_report_url = f"{BASE_URL}/index.php?JdL=LAPORAN%20->%20REKAP%20DATA%20PER%20SEMESTER&IncFile=cmVrYXBfcGVyc2VkaWFhbl9zZW1lc3Rlcg==&IdL=VFhwck5VNTNQVDA9"
-            await page.goto(target_report_url, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=10000)
-
-            # Step D: Klik Tombol "Rekap" di dalam Website
-            # Coba cari tombol Rekap / Preview
-            rekap_btn = page.locator('input[value="Rekap"], button:has-text("Rekap"), input[value="Preview"]')
-            if await rekap_btn.count() > 0:
-                await rekap_btn.first.click()
-                await page.wait_for_timeout(3000)  # Tunggu AJAX memuat tabel
-
-            # Step E: Ambil Isi HTML yang sudah lengkap dengan tabel data
-            html_content = await page.content()
-            await browser.close()
-
-            # Parsing tabel
-            tables = pd.read_html(io.StringIO(html_content))
-            if not tables:
-                return None, "Tabel data belum ditemukan pada halaman."
-
-            # Pilih tabel yang memiliki kolom data barang (Kode / Deskripsi / Nilai)
-            for t in tables:
-                flat_text = " ".join([str(x) for x in t.values.flatten()]).lower()
-                if "deskripsi" in flat_text or "saldo" in flat_text or "masuk" in flat_text or "bahan" in flat_text:
-                    return t, "success"
-
-            # Fallback ambil tabel terbesar
-            df_max = max(tables, key=lambda t: t.shape[0] * t.shape[1])
-            return df_max, "success"
-
-        except Exception as e:
-            await browser.close()
-            return None, str(e)
-
-@st.cache_data(ttl=600)  # Cache 10 menit agar tidak memberatkan server
-def load_data():
-    return asyncio.run(scrape_sipper_auto())
+    except Exception as e:
+        return None, str(e)
 
 # --- 4. TAMPILAN DASHBOARD ---
-st.title("📦 Dashboard Live Monitoring Persediaan (SiPPER HST)")
-st.caption("Pemerintah Kabupaten Hulu Sungai Tengah — Data Disinkronkan Otomatis Secara Real-Time")
+st.title("📦 Dashboard Monitoring Persediaan (SiPPER HST)")
+st.caption("Pemerintah Kabupaten Hulu Sungai Tengah — Data Otomatis Real-Time")
 
-# Sidebar
-st.sidebar.header("⚙️ Kontrol Sistem")
-if st.sidebar.button("🔄 Sinkronisasi Ulang Data"):
+# Sidebar Filter
+st.sidebar.header("⚙️ Filter Laporan")
+if st.sidebar.button("🔄 Tarik Data Terbaru"):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.info("Dashboard ini menarik data persediaan secara langsung dari sistem SiPPER tanpa perlu upload manual.")
+sel_unit = st.sidebar.text_input("Kode Sub Unit / SKPD", value="1.02.01.01")
+sel_tahun = st.sidebar.selectbox("Tahun Anggaran", ["2026", "2025", "2024"], index=0)
+sel_smt = st.sidebar.selectbox("Semester", ["Semester 1", "Semester 2"], index=0)
+smt_val = "1" if sel_smt == "Semester 1" else "2"
 
-# Load Data
-with st.spinner("Mengakses sistem SiPPER HST dan menarik laporan semester..."):
-    df_raw, status = load_data()
+# Memuat Data
+with st.spinner("Menarik data laporan langsung dari SiPPER..."):
+    df_raw, status = fetch_sipper_auto(unit_kode=sel_unit, tahun=sel_tahun, semester=smt_val)
 
 if df_raw is not None:
     df = df_raw.copy()
 
-    # Bersihkan Header Bertingkat
-    for i in range(min(5, len(df))):
+    # 1. Deteksi Baris Nama Kolom (Header Tabel)
+    for i in range(min(6, len(df))):
         row_vals = [str(x).lower() for x in df.iloc[i].values]
         if any("deskripsi" in x or "kode" in x or "saldo" in x for x in row_vals):
             df.columns = df.iloc[i]
             df = df.iloc[i+1:].reset_index(drop=True)
             break
 
-    # Standardisasi Nama Kolom
+    # 2. Pemetaan & Penyesuaian Kolom
     col_mapping = {}
     for col in df.columns:
         c_str = str(col).lower()
@@ -142,15 +121,16 @@ if df_raw is not None:
     df = df.rename(columns=col_mapping)
     df = df.dropna(how='all')
 
+    # Filter baris header/warning/total
     if "Deskripsi" in df.columns:
-        df = df[~df["Deskripsi"].astype(str).str.contains("Warning:|Kabupaten|KABUPATEN|None", na=False)]
+        df = df[~df["Deskripsi"].astype(str).str.contains("Warning:|Kabupaten|KABUPATEN|None|JUMLAH", na=False)]
 
-    # Konversi Format Rupiah ke Numerik
+    # Konversi Format Rupiah
     for c in ["Nilai_Masuk", "Nilai_Keluar", "Nilai_Saldo", "Qty_Saldo"]:
         if c in df.columns:
             df[c] = df[c].apply(clean_currency)
 
-    # --- KARTU RINGKASAN METRIK ---
+    # 3. KARTU METRIK UTAMA (KPI)
     st.markdown("### 📊 Ringkasan Nilai Persediaan")
     k1, k2, k3, k4 = st.columns(4)
 
@@ -160,21 +140,25 @@ if df_raw is not None:
     total_item = len(df)
 
     k1.metric("Total Saldo Akhir", f"Rp {total_saldo:,.0f}".replace(",", "."))
-    k2.metric("Total Barang Masuk", f"Rp {total_masuk:,.0f}".replace(",", "."))
-    k3.metric("Total Barang Keluar", f"Rp {total_keluar:,.0f}".replace(",", "."))
+    k2.metric("Total Pengadaan (Masuk)", f"Rp {total_masuk:,.0f}".replace(",", "."))
+    k3.metric("Total Pengeluaran", f"Rp {total_keluar:,.0f}".replace(",", "."))
     k4.metric("Jumlah Item / Rekening", f"{total_item} Baris")
 
     st.markdown("---")
 
-    # --- GRAFIK VISUALISASI ---
+    # 4. GRAFIK VISUALISASI
     c1, c2 = st.columns(2)
     if "Deskripsi" in df.columns and "Nilai_Saldo" in df.columns and df["Nilai_Saldo"].sum() > 0:
         with c1:
             top_saldo = df.nlargest(10, "Nilai_Saldo")
             fig1 = px.bar(
-                top_saldo, x="Nilai_Saldo", y="Deskripsi",
-                orientation="h", title="Top 10 Barang dengan Nilai Saldo Tertinggi",
-                color="Nilai_Saldo", color_continuous_scale="Blues"
+                top_saldo, 
+                x="Nilai_Saldo", 
+                y="Deskripsi",
+                orientation="h", 
+                title="Top 10 Rekening Saldo Terbesar",
+                color="Nilai_Saldo", 
+                color_continuous_scale="Blues"
             )
             fig1.update_layout(yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig1, use_container_width=True)
@@ -183,15 +167,19 @@ if df_raw is not None:
         with c2:
             top_keluar = df.nlargest(10, "Nilai_Keluar")
             fig2 = px.bar(
-                top_keluar, x="Nilai_Keluar", y="Deskripsi",
-                orientation="h", title="Top 10 Barang dengan Pemakaian/Pengeluaran Terbesar",
-                color="Nilai_Keluar", color_continuous_scale="Reds"
+                top_keluar, 
+                x="Nilai_Keluar", 
+                y="Deskripsi",
+                orientation="h", 
+                title="Top 10 Rekening Pengeluaran Terbesar",
+                color="Nilai_Keluar", 
+                color_continuous_scale="Reds"
             )
             fig2.update_layout(yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig2, use_container_width=True)
 
-    # --- TABEL DETAIL BARANG ---
-    st.markdown("### 📋 Rincian Lengkap Data Barang")
+    # 5. TABEL LENGKAP
+    st.markdown("### 📋 Rincian Lengkap Data Persediaan")
     st.dataframe(df, use_container_width=True)
 
 else:
