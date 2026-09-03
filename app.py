@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+# Nonaktifkan peringatan SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
@@ -22,7 +23,7 @@ PASSWORD = st.secrets.get("SIPPER_PASSWORD", "12345678")
 BASE_URL = "http://sipper.hstkab.go.id"
 LOGIN_URL = f"{BASE_URL}/login_.php?IncFile=login"
 
-# 2. FUNGSI KONVERSI NILAI RUPIAH KE ANGKA
+# 2. KONVERSI NILAI RUPIAH KE ANGKA
 def clean_currency(val):
     if pd.isna(val) or str(val).strip() in ["-", "", "nan", "None", "null"]:
         return 0.0
@@ -32,7 +33,7 @@ def clean_currency(val):
     except ValueError:
         return 0.0
 
-# 3. FUNGSI AMBIL DATA OTOMATIS LANGSUNG KE ENDPOINT IFRAME
+# 3. PENARIKAN DATA OTOMATIS LANGSUNG DARI IFRAME LAPORAN
 @st.cache_data(ttl=300)
 def fetch_sipper_auto(unit_kode="1.02.01.01", tahun="2026", semester="1"):
     session = requests.Session()
@@ -43,15 +44,14 @@ def fetch_sipper_auto(unit_kode="1.02.01.01", tahun="2026", semester="1"):
     }
     
     try:
-        # A. Login Otomatis
+        # A. Otentikasi Login
         payload = {
             "fUsr": USERNAME,
             "fPas": PASSWORD
         }
         session.post(LOGIN_URL, data=payload, headers=headers, timeout=15, verify=False)
         
-        # B. Akses Langsung Endpoint Iframe Laporan (Sesuai DevTools)
-        # Endpoint: rekap_persediaan_semester.php?fKdU=...&fThn=...&fSmt=...&IdL=...
+        # B. Tembak Langsung Endpoint Iframe Laporan
         report_url = f"{BASE_URL}/rekap_persediaan_semester.php?fKdU={unit_kode}&fThn={tahun}&fSmt={semester}&IdL=VFhwck5VNTNQVDA9"
         
         resp = session.get(report_url, headers=headers, timeout=25, verify=False)
@@ -59,12 +59,12 @@ def fetch_sipper_auto(unit_kode="1.02.01.01", tahun="2026", semester="1"):
         if resp.status_code != 200:
             return None, f"HTTP Error {resp.status_code}"
 
-        # C. Ekstrak Tabel dari Respon HTML
+        # C. Ekstrak Tabel Data Barang
         tables = pd.read_html(io.StringIO(resp.text))
         if not tables:
-            return None, "Tabel data laporan tidak ditemukan pada respon halaman."
+            return None, "Tabel data laporan tidak ditemukan."
 
-        # Ambil tabel data utama (tabel dengan jumlah sel terbanyak)
+        # Ambil tabel dengan sel terbanyak
         df_target = max(tables, key=lambda t: t.shape[0] * t.shape[1])
         return df_target, "success"
 
@@ -72,12 +72,12 @@ def fetch_sipper_auto(unit_kode="1.02.01.01", tahun="2026", semester="1"):
         return None, str(e)
 
 # --- 4. TAMPILAN DASHBOARD ---
-st.title("📦 Dashboard Monitoring Persediaan (SiPPER HST)")
-st.caption("Pemerintah Kabupaten Hulu Sungai Tengah — Data Otomatis Real-Time")
+st.title("📦 Dashboard Live Monitoring Persediaan (SiPPER HST)")
+st.caption("Pemerintah Kabupaten Hulu Sungai Tengah — Data Disinkronkan Otomatis Secara Real-Time")
 
 # Sidebar Filter
-st.sidebar.header("⚙️ Filter Laporan")
-if st.sidebar.button("🔄 Tarik Data Terbaru"):
+st.sidebar.header("⚙️ Filter Data SiPPER")
+if st.sidebar.button("🔄 Sinkronkan Data Terbaru"):
     st.cache_data.clear()
     st.rerun()
 
@@ -86,14 +86,14 @@ sel_tahun = st.sidebar.selectbox("Tahun Anggaran", ["2026", "2025", "2024"], ind
 sel_smt = st.sidebar.selectbox("Semester", ["Semester 1", "Semester 2"], index=0)
 smt_val = "1" if sel_smt == "Semester 1" else "2"
 
-# Memuat Data
-with st.spinner("Menarik data laporan langsung dari SiPPER..."):
+# Eksekusi Pengambilan Data
+with st.spinner("Menghubungi server SiPPER HST dan mengambil data..."):
     df_raw, status = fetch_sipper_auto(unit_kode=sel_unit, tahun=sel_tahun, semester=smt_val)
 
 if df_raw is not None:
     df = df_raw.copy()
 
-    # 1. Deteksi Baris Nama Kolom (Header Tabel)
+    # 1. Cari Baris Header Nama Kolom yang Sebenarnya
     for i in range(min(6, len(df))):
         row_vals = [str(x).lower() for x in df.iloc[i].values]
         if any("deskripsi" in x or "kode" in x or "saldo" in x for x in row_vals):
@@ -101,7 +101,7 @@ if df_raw is not None:
             df = df.iloc[i+1:].reset_index(drop=True)
             break
 
-    # 2. Pemetaan & Penyesuaian Kolom
+    # 2. Standardisasi Nama Kolom
     col_mapping = {}
     for col in df.columns:
         c_str = str(col).lower()
@@ -121,11 +121,11 @@ if df_raw is not None:
     df = df.rename(columns=col_mapping)
     df = df.dropna(how='all')
 
-    # Filter baris header/warning/total
+    # Filter baris sampah/header banner
     if "Deskripsi" in df.columns:
         df = df[~df["Deskripsi"].astype(str).str.contains("Warning:|Kabupaten|KABUPATEN|None|JUMLAH", na=False)]
 
-    # Konversi Format Rupiah
+    # Konversi Kolom Angka
     for c in ["Nilai_Masuk", "Nilai_Keluar", "Nilai_Saldo", "Qty_Saldo"]:
         if c in df.columns:
             df[c] = df[c].apply(clean_currency)
@@ -142,7 +142,7 @@ if df_raw is not None:
     k1.metric("Total Saldo Akhir", f"Rp {total_saldo:,.0f}".replace(",", "."))
     k2.metric("Total Pengadaan (Masuk)", f"Rp {total_masuk:,.0f}".replace(",", "."))
     k3.metric("Total Pengeluaran", f"Rp {total_keluar:,.0f}".replace(",", "."))
-    k4.metric("Jumlah Item / Rekening", f"{total_item} Baris")
+    k4.metric("Jumlah Item Rekening", f"{total_item} Baris")
 
     st.markdown("---")
 
@@ -156,7 +156,7 @@ if df_raw is not None:
                 x="Nilai_Saldo", 
                 y="Deskripsi",
                 orientation="h", 
-                title="Top 10 Rekening Saldo Terbesar",
+                title="Top 10 Barang/Rekening Saldo Terbesar",
                 color="Nilai_Saldo", 
                 color_continuous_scale="Blues"
             )
@@ -171,16 +171,16 @@ if df_raw is not None:
                 x="Nilai_Keluar", 
                 y="Deskripsi",
                 orientation="h", 
-                title="Top 10 Rekening Pengeluaran Terbesar",
+                title="Top 10 Barang/Rekening Pemakaian Terbesar",
                 color="Nilai_Keluar", 
                 color_continuous_scale="Reds"
             )
             fig2.update_layout(yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig2, use_container_width=True)
 
-    # 5. TABEL LENGKAP
-    st.markdown("### 📋 Rincian Lengkap Data Persediaan")
+    # 5. TABEL RINCIAN LENGKAP
+    st.markdown("### 📋 Rincian Lengkap Data Barang Persediaan")
     st.dataframe(df, use_container_width=True)
 
 else:
-    st.error(f"Gagal memuat data otomatis: {status}")
+    st.error(f"Gagal memuat data: {status}")
