@@ -1,196 +1,183 @@
-import io
-import re
-import warnings
+from io import BytesIO
 import pandas as pd
-import pdfplumber
-import plotly.express as px
+import requests
 import streamlit as st
 
-warnings.filterwarnings("ignore")
-
 st.set_page_config(
-    page_title="Dashboard Monitoring Persediaan SiPPER HST",
-    page_icon="📦",
-    layout="wide"
+    page_title="Dashboard Rekon SIPPER HST", page_icon="📦", layout="wide"
 )
 
-# 1. FUNGSI MEMBERSIHKAN FORMAT RUPIAH KE ANGKA
-def clean_currency(val):
-    if pd.isna(val) or str(val).strip() in ["-", "", "nan", "None", "null"]:
-        return 0.0
-    val_str = str(val).replace("Rp", "").replace(".", "").replace(",", ".").strip()
-    try:
-        return float(val_str)
-    except ValueError:
-        return 0.0
-
-# 2. FUNGSI PARSER TABEL DARI PDF LAPORAN SIPPER
-def parse_sipper_pdf(pdf_file):
-    all_rows = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    # Filter baris yang tidak kosong sama sekali
-                    clean_row = [cell.strip() if cell is not None else "" for cell in row]
-                    if any(clean_row):
-                        all_rows.append(clean_row)
-                        
-    if not all_rows:
-        return None, "Tidak ditemukan tabel pada file PDF."
-
-    # Cari panjang kolom terbanyak untuk menyelaraskan dataframe
-    max_cols = max(len(r) for r in all_rows)
-    standardized_rows = [r + [""] * (max_cols - len(r)) for r in all_rows]
-    
-    df_raw = pd.DataFrame(standardized_rows)
-    
-    # Deteksi baris header (mencari kata Deskripsi, Rekening, Saldo, Nama Barang, dll)
-    header_idx = -1
-    for i in range(min(10, len(df_raw))):
-        row_str = " ".join([str(x).lower() for x in df_raw.iloc[i].values])
-        if any(k in row_str for k in ["deskripsi", "nama barang", "kode", "uraian", "saldo"]):
-            header_idx = i
-            break
-            
-    if header_idx != -1:
-        df_raw.columns = df_raw.iloc[header_idx]
-        df_data = df_raw.iloc[header_idx + 1:].reset_index(drop=True)
-    else:
-        df_data = df_raw
-
-    # Standardisasi Nama Kolom
-    col_mapping = {}
-    for col in df_data.columns:
-        c_str = str(col).lower()
-        if any(k in c_str for k in ["deskripsi", "nama barang", "uraian", "nama rekening"]):
-            col_mapping[col] = "Deskripsi"
-        elif "kode" in c_str:
-            col_mapping[col] = "Kode"
-        elif "masuk" in c_str and ("nilai" in c_str or "rupiah" in c_str or "rp" in c_str or "harga" in c_str):
-            col_mapping[col] = "Nilai_Masuk"
-        elif "keluar" in c_str and ("nilai" in c_str or "rupiah" in c_str or "rp" in c_str or "harga" in c_str):
-            col_mapping[col] = "Nilai_Keluar"
-        elif "saldo" in c_str and ("nilai" in c_str or "rupiah" in c_str or "rp" in c_str or "harga" in c_str):
-            col_mapping[col] = "Nilai_Saldo"
-        elif "saldo" in c_str and ("qty" in c_str or "jumlah" in c_str or "kuantitas" in c_str):
-            col_mapping[col] = "Qty_Saldo"
-        elif "satuan" in c_str:
-            col_mapping[col] = "Satuan"
-
-    df_data = df_data.rename(columns=col_mapping)
-    
-    # Hapus baris total summary atau judul banner di tengah halaman
-    if "Deskripsi" in df_data.columns:
-        df_data = df_data[~df_data["Deskripsi"].astype(str).str.contains("JUMLAH|TOTAL|Kabupaten|KABUPATEN|Hulu Sungai Tengah|None|^$", regex=True, na=False)]
-    
-    # Konversi Nilai Rupiah
-    for col_val in ["Nilai_Masuk", "Nilai_Keluar", "Nilai_Saldo", "Qty_Saldo"]:
-        if col_val in df_data.columns:
-            df_data[col_val] = df_data[col_val].apply(clean_currency)
-            
-    return df_data, "success"
-
-# --- 3. TAMPILAN DASHBOARD STREAMLIT ---
-st.title("📦 Dashboard Monitoring Persediaan (SiPPER HST)")
-st.caption("Pemerintah Kabupaten Hulu Sungai Tengah — Parser Otomatis Laporan PDF")
-
-# Sidebar Upload
-st.sidebar.header("📁 Unggah Laporan PDF")
-uploaded_pdf = st.sidebar.file_uploader(
-    "Pilih file PDF Rekap / Mutasi SiPPER:",
-    type=["pdf"],
-    help="Upload file laporan berformat PDF hasil cetak dari menu SiPPER HST."
+st.title("📦 Dashboard Monitoring & Rekonsiliasi SIPPER")
+st.caption(
+    "Monitoring Persediaan & Rekonsiliasi Data Internal vs Sistem SIPPER"
 )
 
-if uploaded_pdf is not None:
-    with st.spinner("Membaca dan mengekstrak tabel dari PDF..."):
-        df, status = parse_sipper_pdf(uploaded_pdf)
+# --- SIDEBAR: KONFIGURASI KONEKSI SIPPER ---
+st.sidebar.header("⚙️ Pengaturan Sumber Data SIPPER")
 
-    if df is not None and not df.empty:
-        st.success(f"✅ Berhasil memproses data dari file **{uploaded_pdf.name}**")
+# Masukkan link AJAX dari tab Network
+default_url = "https://sipper.hstkab.go.id/rekap_persemester_data.php"
+endpoint_url = st.sidebar.text_input(
+    "URL Endpoint SIPPER", value=default_url, help="Salin dari tab Network"
+)
 
-        # --- KARTU METRIK UTAMA (KPI) ---
-        st.markdown("### 📊 Ringkasan Nilai Persediaan")
-        k1, k2, k3, k4 = st.columns(4)
+# Cookie sesi login (PHPSESSID)
+session_cookie = st.sidebar.text_input(
+    "Session Cookie (PHPSESSID)",
+    type="password",
+    help="Salin nilai cookie dari tab Headers browser",
+)
 
-        total_saldo = df["Nilai_Saldo"].sum() if "Nilai_Saldo" in df.columns else 0.0
-        total_masuk = df["Nilai_Masuk"].sum() if "Nilai_Masuk" in df.columns else 0.0
-        total_keluar = df["Nilai_Keluar"].sum() if "Nilai_Keluar" in df.columns else 0.0
-        total_item = len(df)
+col_fetch, col_info = st.sidebar.columns([1, 1])
 
-        k1.metric("Total Saldo Akhir", f"Rp {total_saldo:,.0f}".replace(",", "."))
-        k2.metric("Total Pengadaan (Masuk)", f"Rp {total_masuk:,.0f}".replace(",", "."))
-        k3.metric("Total Pengeluaran", f"Rp {total_keluar:,.0f}".replace(",", "."))
-        k4.metric("Jumlah Item / Rekening", f"{total_item} Item")
 
-        st.markdown("---")
+# Fungsi Penarik Data SIPPER
+@st.cache_data(ttl=300)
+def fetch_sipper_data(url, cookie):
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      ),
+      "Cookie": f"PHPSESSID={cookie}" if cookie else "",
+  }
+  try:
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code == 200:
+      tables = pd.read_html(response.text)
+      if tables:
+        df = tables[0]
+        # Penyesuaian nama kolom bertingkat jika ada
+        if isinstance(df.columns, pd.MultiIndex):
+          df.columns = ["_".join(col).strip() for col in df.columns.values]
+        return df, None
+      return None, "Tabel data tidak ditemukan di halaman response."
+    return None, f"Gagal mengakses web (HTTP Status: {response.status_code})"
+  except Exception as e:
+    return None, f"Error koneksi: {str(e)}"
 
-        # --- GRAFIK VISUALISASI ---
-        c1, c2 = st.columns(2)
-        if "Deskripsi" in df.columns and "Nilai_Saldo" in df.columns and df["Nilai_Saldo"].sum() > 0:
-            with c1:
-                top_saldo = df.nlargest(10, "Nilai_Saldo")
-                fig1 = px.bar(
-                    top_saldo, 
-                    x="Nilai_Saldo", 
-                    y="Deskripsi",
-                    orientation="h", 
-                    title="Top 10 Barang/Rekening Saldo Terbesar",
-                    color="Nilai_Saldo", 
-                    color_continuous_scale="Blues"
-                )
-                fig1.update_layout(yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig1, use_container_width=True)
 
-        if "Deskripsi" in df.columns and "Nilai_Keluar" in df.columns and df["Nilai_Keluar"].sum() > 0:
-            with c2:
-                top_keluar = df.nlargest(10, "Nilai_Keluar")
-                fig2 = px.bar(
-                    top_keluar, 
-                    x="Nilai_Keluar", 
-                    y="Deskripsi",
-                    orientation="h", 
-                    title="Top 10 Barang/Rekening Pemakaian Terbesar",
-                    color="Nilai_Keluar", 
-                    color_continuous_scale="Reds"
-                )
-                fig2.update_layout(yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig2, use_container_width=True)
+# --- TABS UTAMA ---
+tab_monitor, tab_rekon = st.tabs(
+    ["📊 Data Live SIPPER", "⚖️ Rekonsiliasi Data"]
+)
 
-        # --- TABEL DETAIL RINCIAN & DOWNLOAD EXCEL ---
-        st.markdown("### 📋 Rincian Data Barang Persediaan")
-        
-        # Fitur Pencarian Barang
-        search_query = st.text_input("🔍 Cari Nama / Kode Barang:", "")
-        if search_query:
-            df_filtered = df[df.apply(lambda row: search_query.lower() in row.astype(str).str.lower().values, axis=1)]
-        else:
-            df_filtered = df
+# TAB 1: MONITORING LIVE SIPPER
+with tab_monitor:
+  if st.button("🔄 Tarik / Refresh Data SIPPER"):
+    st.session_state["refresh"] = True
 
-        st.dataframe(df_filtered, use_container_width=True)
+  if endpoint_url:
+    with st.spinner("Mengambil data dari SIPPER..."):
+      df_sipper, err = fetch_sipper_data(endpoint_url, session_cookie)
 
-        # Tombol Download ke Format Excel Bersih
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name="Data_Persediaan")
-            
-        st.download_button(
-            label="📥 Download Hasil Ekstraksi ke Excel (.xlsx)",
-            data=buffer.getvalue(),
-            file_name=f"Rekap_Persediaan_{uploaded_pdf.name}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    if err:
+      st.warning(err)
+      st.info(
+          "Alternatif: Jika sesi login kedaluwarsa, Anda juga dapat mengunggah"
+          " file ekspor HTML/Excel SIPPER secara manual di Tab Rekonsiliasi."
+      )
+    elif df_sipper is not None:
+      st.success(
+          f"Data berhasil dimuat! Total entri: {len(df_sipper)} baris barang."
+      )
+
+      # Metric Ringkas
+      m1, m2 = st.columns(2)
+      m1.metric("Total Jenis Barang", len(df_sipper))
+
+      st.dataframe(df_sipper, use_container_width=True)
+
+      # Tombol Download Data Bersih
+      excel_buffer = BytesIO()
+      df_sipper.to_excel(excel_buffer, index=False)
+      st.download_button(
+          label="📥 Unduh Data Ini ke Excel (.xlsx)",
+          data=excel_buffer.getvalue(),
+          file_name="data_sipper_terkini.xlsx",
+          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      )
+  else:
+    st.info("Masukkan Endpoint URL SIPPER pada panel samping.")
+
+# TAB 2: PROSES REKONSILIASI
+with tab_rekon:
+  st.subheader("Bandingkan Data SIPPER vs Catatan Fisik / SPJ")
+
+  col_up1, col_up2 = st.columns(2)
+  with col_up1:
+    file_internal = st.file_uploader(
+        "1. Upload Data Internal / Fisik (Excel/CSV)", type=["xlsx", "csv"]
+    )
+  with col_up2:
+    st.write("2. Sumber Data Pembanding:")
+    use_live = st.checkbox(
+        "Gunakan Data Live SIPPER dari Tab 1", value=True if endpoint_url else False
+    )
+    file_sipper_manual = None
+    if not use_live:
+      file_sipper_manual = st.file_uploader(
+          "Upload File Cadangan SIPPER", type=["xlsx", "csv"]
+      )
+
+  if file_internal:
+    # Membaca file internal
+    df_in = (
+        pd.read_excel(file_internal)
+        if file_internal.name.endswith("xlsx")
+        else pd.read_csv(file_internal)
+    )
+
+    # Menentukan sumber data SIPPER
+    target_sipper_df = None
+    if use_live and "df_sipper" in locals() and df_sipper is not None:
+      target_sipper_df = df_sipper
+    elif file_sipper_manual:
+      target_sipper_df = (
+          pd.read_excel(file_sipper_manual)
+          if file_sipper_manual.name.endswith("xlsx")
+          else pd.read_csv(file_sipper_manual)
+      )
+
+    if target_sipper_df is not None:
+      st.markdown("---")
+      st.subheader("Pemetaan Kolom Kunci Rekon")
+      c_k1, c_k2, c_k3 = st.columns(3)
+
+      # Pilih kolom penghubung (Key)
+      key_in = c_k1.selectbox(
+          "Kolom Kode di Data Internal", options=df_in.columns
+      )
+      key_sip = c_k2.selectbox(
+          "Kolom Kode di Data SIPPER", options=target_sipper_df.columns
+      )
+      col_qty_sip = c_k3.selectbox(
+          "Kolom Qty Saldo SIPPER", options=target_sipper_df.columns
+      )
+
+      # Penggabungan & Logika Deteksi Selisih
+      df_merged = pd.merge(
+          target_sipper_df,
+          df_in,
+          left_on=key_sip,
+          right_on=key_in,
+          how="outer",
+          suffixes=("_SIPPER", "_INTERNAL"),
+      )
+
+      st.subheader("Hasil Rekonsiliasi")
+      st.dataframe(df_merged, use_container_width=True)
+
+      # Download Hasil Rekon
+      out_rekon = BytesIO()
+      df_merged.to_excel(out_rekon, index=False)
+      st.download_button(
+          label="📥 Unduh Hasil Rekonsiliasi (.xlsx)",
+          data=out_rekon.getvalue(),
+          file_name="hasil_rekon_persediaan.xlsx",
+          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      )
     else:
-        st.error(f"Gagal memproses file PDF: {status}")
-else:
-    # Tampilan saat belum ada file yang diupload
-    st.info("👈 Silakan unggah file PDF Laporan Rekap/Mutasi dari SiPPER melalui panel di sebelah kiri.")
-    st.markdown("""
-    #### 💡 Panduan Cepat:
-    1. Buka SiPPER HST $\rightarrow$ Pilih Menu **Laporan** (Rekap Semester / Mutasi).
-    2. Klik tombol **Cetak / Simpan sebagai PDF**.
-    3. Unggah file PDF tersebut ke sidebar dashboard ini.
-    4. Dashboard akan secara otomatis memproses tabel, menghitung saldo, membuat grafik, dan menyediakan tombol unduh ke Excel.
-    """)
+      st.warning(
+          "Data SIPPER belum tersedia. Ambil data live di Tab 1 atau upload"
+          " file cadangan."
+      )
